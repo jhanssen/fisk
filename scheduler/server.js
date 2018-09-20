@@ -115,10 +115,12 @@ class Server extends EventEmitter {
         switch (url.pathname) {
         case "/compile":
             // look at headers
-            if (!("x-fisk-environments" in req.headers)) {
-                error("No x-fisk-environments header");
+            let env = req.headers["x-fisk-environment"] || req.headers["x-fisk-environments"]; // backwards compatible
+            if (!env) {
+                error("No x-fisk-environment(s) header");
                 return;
             }
+
 
             const configVersion = req.headers["x-fisk-config-version"];
             if (configVersion != this.configVersion) {
@@ -126,13 +128,11 @@ class Server extends EventEmitter {
                 console.log("Balls", req.headers);
                 return;
             }
-            const compileEnvironments = req.headers["x-fisk-environments"].replace(/\s+/g, '').split(';').filter(x => x);
-
             let data = {
-                ws: ws,
+                ws:ws,
                 ip: ip,
                 type: Client.Type.Compile,
-                environments: compileEnvironments,
+                environment: env,
                 sourceFile: req.headers["x-fisk-sourcefile"]
             };
             const preferredSlave = req.headers["x-fisk-slave"];

@@ -23,6 +23,7 @@ let activeJobs = 0;
 let jobId = 0;
 let db = new Database(path.join(common.cacheDir(), "db.json"));
 let pendingUsers = {};
+let compatibleHashes = {};
 
 function slaveKey() {
     if (arguments.length == 1) {
@@ -318,30 +319,16 @@ let semaphoreMaintenanceTimers = {};
 let pendingEnvironments = {};
 server.on("compile", function(compile) {
     let arrived = Date.now();
-    console.log("request", compile.hostname, compile.ip, compile.environments);
-    let found = false;
-    for (let i=0; i<compile.environments.length; ++i) {
-        if (Environments.hasEnvironment(compile.environments[i])) {
-            found = true;
-            break;
-        }
-    }
-    let needed = [];
-    if (!found) {
-        compile.environments.forEach(env => {
-            // console.log(`checking ${env} ${pendingEnvironments} ${env in pendingEnvironments}`);
-            if (!(env in pendingEnvironments)) {
-                needed.push(env);
-                pendingEnvironments[env] = true;
-            }
-        });
-        if (!needed.length) {
-            console.log(`We're already waiting for ${compile.environments}`);
+    console.log("request", compile.hostname, compile.ip, compile.environment);
+    if (!Environments.hasEnvironment(compile.environment)) {
+        if (compile.environment in pendingEnvironments) {
+            console.log(`We're already waiting for ${compile.environment}`);
             compile.send("slave", {});
             return;
         }
+        pendingEnvironments[compile.environment] = true;
         console.log(`Asking ${compile.name} ${compile.ip} to upload ${needed}`);
-        compile.send({ type: "needsEnvironment", environments: needed });
+        compile.send({ type: "needsEnvironment", environment: compile.environment });
 
         let file;
         let gotLast = false;
@@ -393,9 +380,7 @@ server.on("compile", function(compile) {
                 file.discard();
                 file = undefined;
             }
-            needed.forEach(env => {
-                delete pendingEnvironments[env];
-            });
+            delete pendingEnvironments[compile.environment];
         });
         compile.once("close", () => {
             if (file && !gotLast) {
@@ -403,12 +388,14 @@ server.on("compile", function(compile) {
                 file.discard();
                 file = undefined;
             }
-            needed.forEach(env => {
-                delete pendingEnvironments[env];
-            });
+            delete pendingEnvironments[compile.environment];
         });
 
         return;
+    }
+    let environments = [ compile.environment ];
+    if (compatibleHashes[compile.environment]) {
+        environments = environments.concat(Object.keys(compatibleHashes[compile.environment]));
     }
 
     function score(s) {
@@ -420,14 +407,14 @@ server.on("compile", function(compile) {
     let bestScore;
     forEachSlave(s => {
         found = false;
-        for (let i=0; i<compile.environments.length; ++i) {
-            if (compile.environments[i] in s.environments) {
+        for (let i=0; i<environments.length; ++i) {
+            if (environments[i] in s.environments) {
                 found = true;
                 break;
             }
         }
 
-        // console.log(`Any finds for ${compile.environments} ${found}`);
+        // console.log(`Any finds for ${environments} ${found}`);
 
         if (found) {
             let slaveScore;
@@ -518,7 +505,45 @@ server.on("compile", function(compile) {
 
 function writeConfiguration(change)
 {
+    return new Promise((resolve, reject) => {
+        if ((change.add instanceof Array) == (change.remove instanceof Array)) {
+            reject(new Error("Bad change"));
+        }
+        switch (change.field) {
+        case "compatibleHash":
+            if (change.add) {
+                if (change.add.length != 2)
+                    throw new Error("Bad change");
+                if (!compatibleHashes[change.add[0]])
+                    compatibleHashes[change.add[0]] = {};
+                compatibleHashes[change.add[0]][change.add[1]] = true;
+                if (!compatibleHashes[change.add[1]])
+                    compatibleHashes[change.add[1]] = {};
+                compatibleHashes[change.add[1]][change.add[0]] = true;
+            } else { // change.remove
+                if (change.remove.length != 2)
+                    throw new Error("Bad change");
+                if (compatibleHashes[change.add[0]]) {
+                    delete compatibleHashes[change.add[0]][change.add[1]];
+                    if (!Object.length(compatibleHashes[change.add[0]])) {
+                        delete compatibleHashes[change.add[0]];
+                    }
+                }
+                if (compatibleHashes[change.add[1]]) {
+                    delete compatibleHashes[change.add[1]][change.add[0]];
+                    if (!Object.length(compatibleHashes[change.add[1]])) {
+                        delete compatibleHashes[change.add[1]];
+                    }
+                }
+            }
+            return db.set("compatible_hashes", compatibleHashes);
+        }
+    });
+}
 
+function readConfiguration()
+{
+    return { compatibleHashes: compatibleHashes };
 }
 
 function hash(password, salt)
@@ -573,13 +598,23 @@ server.on("monitor", client => {
         }
         switch (message.type) {
         case 'readConfiguration':
+            try {
+                let conf = readConfiguration(message);
+                client.send({ type: "readConfiguration", success: true, configuration: conf });
+            } catch (err) {
+                client.send({ type: "readConfiguration", success: false, "error": err.toString() });
+            }
             break;
         case 'writeConfiguration':
             if (!user) {
                 client.send({ type: "writeConfiguration", success: false, "error": `Unauthenticated message: ${message.type}` });
                 return;
             }
-            writeConfiguration(message);
+            writeConfiguration(message).then(() => {
+                client.send({ type: "writeConfiguration", success: true });
+            }).catch(err => {
+                client.send({ type: "writeConfiguration", success: false, "error": err.toString() });
+            });
             break;
         case 'listUsers': {
             if (!user) {
@@ -736,12 +771,12 @@ server.on("error", err => {
 
 Environments.load(option("env-dir", path.join(common.cacheDir(), "environments")))
     .then(purgeEnvironmentsToMaxSize)
-    // .then(() => {
-    //     return db.get("users");
-    // }).then(u => {
-    //     console.log("got users", u);
-    //     users = u || {};
-    // })
+    .then(() => {
+        return db.get("compatible_hashes");
+    }).then(h => {
+        compatibleHashes = h || {};
+        console.log("got compatible hashes", compatibleHashes);
+    })
     .then(() => server.listen())
     .catch(e => {
         console.error(e);
